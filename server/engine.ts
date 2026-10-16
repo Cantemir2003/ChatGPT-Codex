@@ -4,12 +4,14 @@ import {join,basename,extname} from 'node:path';
 import {setTimeout as delay} from 'node:timers/promises';
 import type {Job,TranscriptionSettings,AppSettings,AudioInfo,Chunk} from '../shared/types.js';
 import {estimateCost} from '../shared/config.js';
+import {applyResponse,isChunkFinished,refreshReview} from '../shared/review.js';
 import {Store} from './store.js';
 import {inspectAudio,prepareChunks} from './audio.js';
+import {analyzeSpeech,VAD_MODEL,VAD_VERSION} from './vad.js';
 import {AppError,validateApp,validateTranscription} from './validation.js';
 import {transcribe,classifyError,type Transcriber,type TranscribeResult} from './transcribe.js';
-interface EngineOptions {key:()=>Promise<string|null>;transcriber?:Transcriber;inspect?:typeof inspectAudio;prepare?:typeof prepareChunks;backoff?:(attempt:number,signal:AbortSignal)=>Promise<void>;}
-const ACTIVE=['queued','preparing','uploading','transcribing','retrying'];
+interface EngineOptions {key:()=>Promise<string|null>;transcriber?:Transcriber;inspect?:typeof inspectAudio;prepare?:typeof prepareChunks;analyze?:typeof analyzeSpeech;backoff?:(attempt:number,signal:AbortSignal)=>Promise<void>;}
+const ACTIVE=['queued','preparing','analyzing','uploading','transcribing','retrying'];
 export class Engine {
  private queue:string[]=[];private running=false;private controller?:AbortController;private active?:string;private stopping=false;private flight?:Promise<void>;
  constructor(public store:Store,private options:EngineOptions){}
@@ -38,12 +40,18 @@ export class Engine {
  private async process(job:Job,signal:AbortSignal){
   try{
    if(!job.chunks.length){job.status='preparing';this.store.save(job);job.chunks=await(this.options.prepare??prepareChunks)(job.sourceFile,join(this.store.jobDir(job.id),'audio'),job.audio,job.appSettings.chunkMinutes,signal);if(!job.chunks.length)throw new AppError('No audio sections could be prepared.');this.store.save(job);}
+   if(!job.speech){
+    signal.throwIfAborted();job.status='analyzing';this.store.save(job);
+    try{const speech=await(this.options.analyze??analyzeSpeech)(job.sourceFile,job.audio,signal);signal.throwIfAborted();job.speech=speech;}
+    catch(error){if(signal.aborted)throw error;job.speech={status:'unavailable',model:VAD_MODEL,version:VAD_VERSION,intervals:[],speechSeconds:0,analyzedSeconds:0,reason:'Local speech analysis could not be completed.'};}
+    this.store.save(job);
+   }
    for(const chunk of [...job.chunks].sort((a,b)=>a.index-b.index)){
-    if(chunk.status==='complete')continue;
+    if(isChunkFinished(chunk))continue;
     signal.throwIfAborted();await this.processChunk(job,chunk,signal);
    }
    job.status='complete';job.error=undefined;job.partialText='';this.store.save(job);
-   if(!job.appSettings.keepAudio)await this.cleanupAudio(job);
+   if(!job.appSettings.keepAudio&&!job.review?.needsReview)await this.cleanupAudio(job);
   }catch(error){
    if(signal.aborted){job.status=this.stopping?'paused':'cancelled';job.error='Stopped. Completed sections are saved. An in-flight request may still be charged.';}
    else if(error instanceof AppError){job.status='failed';job.error=error.message;}
@@ -54,14 +62,16 @@ export class Engine {
  private async processChunk(job:Job,chunk:Chunk,signal:AbortSignal){
   for(let retry=0;;retry++){
    signal.throwIfAborted();const key=await this.options.key();if(!key){this.pauseQueue('Save your API key, then resume.');throw new AppError('Save your API key in Settings, then resume.');}
-   job.partialText='';job.status='uploading';const attempt={startedAt:new Date().toISOString(),outcome:'pending' as const,estimatedUsd:estimateCost(chunk.end-chunk.start)};chunk.attempts.push(attempt);const index=chunk.attempts.length-1;this.store.save(job);this.store.record(job,chunk.id,index,attempt);
+   job.partialText='';job.status='uploading';chunk.status='pending';const attempt={startedAt:new Date().toISOString(),outcome:'pending' as const,estimatedUsd:estimateCost(chunk.end-chunk.start)};chunk.attempts.push(attempt);const index=chunk.attempts.length-1;this.store.save(job);this.store.record(job,chunk.id,index,attempt);
    let lastSave=0;let result:TranscribeResult;
    const persistProgress=()=>{try{this.store.save(job);}catch{throw new AppError('Local progress could not be saved. Free disk space before resuming; the request may have been charged.',500);}};
    try{
     result=await(this.options.transcriber??transcribe)({file:chunk.file,settings:job.settings,key,signal,onDelta:delta=>{job.partialText+=delta;if(Date.now()-lastSave>1000){persistProgress();lastSave=Date.now();}},onPhase:phase=>{job.status=phase;persistProgress();}});
-    if(typeof result.text!=='string')throw new Error('invalid_response');
    }catch(error){
-    const info=error instanceof AppError?{message:error.message,retryable:false,uncertain:true,stopQueue:true}:classifyError(error);chunk.attempts[index]={...attempt,outcome:signal.aborted||info.uncertain?'uncertain':'failed',endedAt:new Date().toISOString()};this.store.save(job);this.store.record(job,chunk.id,index,chunk.attempts[index]);
+    const info=error instanceof AppError?{message:error.message,retryable:false,uncertain:true,stopQueue:true}:classifyError(error);
+    const status=error&&typeof error==='object'?(error as {status?:number}).status:undefined;
+    chunk.status=signal.aborted||(info.uncertain&&(!status||status===408))?'interrupted':'failed';
+    chunk.attempts[index]={...attempt,outcome:signal.aborted||info.uncertain?'uncertain':'failed',endedAt:new Date().toISOString()};this.store.save(job);this.store.record(job,chunk.id,index,chunk.attempts[index]);
     if(signal.aborted)throw error;
     if(info.stopQueue)this.pauseQueue(info.message);
     if(!info.retryable||retry>=job.appSettings.retries)throw new AppError(info.message);
@@ -69,14 +79,14 @@ export class Engine {
     await(this.options.backoff??((n,s)=>delay(Math.min(30_000,1500*2**n)+Math.floor(Math.random()*400),undefined,{signal:s})))(retry,signal);job.error=undefined;continue;
    }
    // Persistence failures never trigger another paid API request automatically.
-   try{this.store.saveResponse(job,chunk.id,result);}catch{this.pauseQueue('Free disk space before resuming.');throw new AppError('The returned section could not be saved. Free disk space before resuming; this successful API request may have been charged.',500);}
-   chunk.text=result.text;chunk.status='complete';chunk.attempts[index]={...attempt,outcome:'success',endedAt:new Date().toISOString()};job.partialText='';this.store.save(job);this.store.record(job,chunk.id,index,chunk.attempts[index]);return;
+   try{this.store.saveResponse(job,chunk.id,result);}catch{chunk.status='interrupted';chunk.attempts[index]={...attempt,outcome:'uncertain',endedAt:new Date().toISOString()};this.pauseQueue('Free disk space before resuming.');throw new AppError('The returned section could not be saved. Free disk space before resuming; this successful API request may have been charged.',500);}
+   applyResponse(chunk,result);chunk.attempts[index]={...attempt,outcome:'success',endedAt:new Date().toISOString()};job.partialText='';this.store.save(job);this.store.record(job,chunk.id,index,chunk.attempts[index]);return;
   }
  }
  private pauseQueue(reason:string){for(const id of this.queue){const j=this.store.get(id);j.status='paused';j.error=reason;this.store.save(j);}this.queue=[];}
  cancel(id:string){const job=this.store.get(id);if(job.status==='complete')return job;this.queue=this.queue.filter(x=>x!==id);if(this.active===id&&this.controller){this.controller.abort();}else{job.status='cancelled';job.error='Stopped. Completed sections are saved.';this.store.save(job);}return job;}
  async remove(id:string){const job=this.store.get(id);if(ACTIVE.includes(job.status)||this.active===id&&this.running)throw new AppError('Stop this lecture before deleting it.',409);this.store.remove(id);}
- async cleanupAudio(job:Job){try{this.store.assertOwned(job);await rm(join(this.store.jobDir(job.id),'audio'),{recursive:true,force:true});await rm(job.sourceFile,{force:true});job.audioAvailable=false;this.store.save(job);}catch{job.error='Transcription is complete. Temporary audio could not be cleaned up; you can delete this lecture from history after exporting.';this.store.save(job);}}
+ async cleanupAudio(job:Job){refreshReview(job);if(job.status!=='complete'||!job.chunks.length||!job.chunks.every(isChunkFinished)||job.appSettings.keepAudio||job.review?.needsReview)return;try{this.store.assertOwned(job);await rm(join(this.store.jobDir(job.id),'audio'),{recursive:true,force:true});await rm(job.sourceFile,{force:true});job.audioAvailable=false;this.store.save(job);}catch{job.error='Transcription is complete. Temporary audio could not be cleaned up; you can delete this lecture from history after exporting.';this.store.save(job);}}
  async stop(){this.stopping=true;this.pauseQueue('The app stopped. Resume when you reopen it.');this.controller?.abort();await this.flight;}
  async idle(){await this.flight;}
 }

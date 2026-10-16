@@ -9,6 +9,7 @@ import { isValidKey, MacOSKeyStore, type KeyStore } from '../server/keychain.js'
 import { DEFAULTS, PRICING } from '../shared/config.js';
 import type { Job } from '../shared/types.js';
 import { Store } from '../server/store.js';
+import {applyResponse,assembleTranscript,refreshReview} from '../shared/review.js';
 
 class MemoryKeyStore implements KeyStore {
   key: string | null = null;
@@ -66,6 +67,23 @@ afterEach(async () => {
 });
 
 describe('local HTTP security', () => {
+  it('exports review markers with their real file/range and keeps raw response text unchanged',async()=>{
+    job.status='complete';
+    job.chunks=[{...job.chunks[0],id:'chunk-000000',start:0,end:4,text:'  Țesut dentar.\n'},
+      {...job.chunks[0],id:'chunk-000001',index:1,start:4,end:9.75},
+      {...job.chunks[0],id:'chunk-000002',index:2,start:9.75,end:10}];
+    applyResponse(job.chunks[1],{text:''});applyResponse(job.chunks[2],{text:' \t'});
+    job.speech={status:'complete',model:'fixture',version:'1',intervals:[],speechSeconds:0,analyzedSeconds:10};
+    refreshReview(job);job.text=assembleTranscript(job);
+    const response=await fetch(`${base}/api/jobs/${job.id}/export`);
+    expect(response.status).toBe(200);expect(await response.text()).toBe(job.text);
+    expect(job.text).toContain('Curs științific.m4a | 00:00:04–00:00:09.750');
+    expect(job.text).toContain('00:00:09.750–00:00:10');
+    const publicValue=await fetch(`${base}/api/jobs/${job.id}`).then(r=>r.json());
+    expect(publicValue.review.missingTextCount).toBe(2);
+    expect(publicValue.chunks[0].text).toBe('  Țesut dentar.\n');
+    expect(publicValue.chunks[1].status).toBe('no_text');expect(publicValue.chunks[1].file).toBe('');
+  });
   it('allows launcher health checks and sends browser hardening headers without CORS', async () => {
     const response = await fetch(`${base}/api/health`);
     expect(await response.json()).toEqual({ app: 'lecture-transcriber' });
@@ -337,7 +355,10 @@ describe('saved lecture file ownership', () => {
     const recovered = new Store(dataDir).get(saved.id);
     expect(recovered.status).toBe('complete');
     expect(recovered.audioAvailable).toBe(false);
-    expect(recovered.text).toBe(saved.chunks[0].text);
+    expect(recovered.text).toContain(saved.chunks[0].text);
+    expect(recovered.text).toContain('VERIFICARE AUDIO INDISPONIBILĂ');
+    expect(recovered.review?.analysisNotRun).toBe(true);
+    expect(recovered.chunks[0].text).toBe(saved.chunks[0].text);
   });
 
   it('rechecks file ownership before saving a response or deleting a lecture', async () => {

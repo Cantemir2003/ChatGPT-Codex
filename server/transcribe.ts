@@ -3,7 +3,9 @@ import {createReadStream} from 'node:fs';
 import {MODEL} from '../shared/config.js';
 import type {TranscriptionSettings} from '../shared/types.js';
 export interface TranscribeInput {file:string;settings:TranscriptionSettings;key:string;signal:AbortSignal;onDelta:(delta:string)=>void;onPhase:(phase:'uploading'|'transcribing')=>void;}
-export interface TranscribeResult {text:string;[key:string]:unknown;}
+// A successful HTTP response is billable even when its text field is absent or invalid.
+// Keep the response untouched so the engine can persist and flag it without resubmitting audio.
+export type TranscribeResult = unknown;
 export type Transcriber=(input:TranscribeInput)=>Promise<TranscribeResult>;
 // Only the fields independently verified for this exact model are allowed here.
 export function requestFields(settings:TranscriptionSettings){return {model:MODEL,response_format:'json' as const,stream:settings.stream,...(settings.prompt?{prompt:settings.prompt}:{}),...(settings.languages.length?{languages:settings.languages}:{}),...(settings.keywords.length?{keywords:settings.keywords}:{})};}
@@ -14,21 +16,21 @@ export const transcribe:Transcriber=async ({file,settings,key,signal,onDelta,onP
   const fields={...requestFields(settings),file:audio};
   if(settings.stream){
    const stream=await client.audio.transcriptions.create({...fields,stream:true},{signal});
-   onPhase('transcribing');const events:unknown[]=[];let final:TranscribeResult|undefined;
+   onPhase('transcribing');const events:unknown[]=[];
    for await(const event of stream){
     events.push(event);
-    if(event.type==='transcript.text.delta')onDelta(event.delta);
-    if(event.type==='transcript.text.done')final={...event,text:event.text};
+    if(event.type==='transcript.text.delta'&&typeof event.delta==='string')onDelta(event.delta);
+    // The terminal event is authoritative. A later socket failure must not discard
+    // a successful, potentially billable response or trigger another request.
+    if(event.type==='transcript.text.done')return {...event,events};
     if((event as {type:string}).type==='error')throw new Error('stream_error');
    }
-   if(!final)throw new Error('incomplete_stream');
-   return {...final,events};
+   throw new Error('incomplete_stream');
   }
   // The SDK does not expose a reliable upload-finished signal for non-streaming requests.
   // UI describes this combined phase as sending audio and waiting for transcription.
   const result=await client.audio.transcriptions.create({...fields,stream:false},{signal});
-  if(typeof result.text!=='string')throw new Error('invalid_response');
-  return {...result,text:result.text};
+  return result;
  }finally{audio.destroy();}
 };
 export function classifyError(error:unknown):{message:string;retryable:boolean;uncertain:boolean;stopQueue:boolean}{

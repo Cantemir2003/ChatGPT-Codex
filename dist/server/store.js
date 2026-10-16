@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, writeFileSync, renameSync, openSync, closeSync
 import { join, resolve, relative, isAbsolute, sep, basename } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DEFAULTS } from '../shared/config.js';
+import { applyResponse, assembleTranscript, isChunkFinished, rawTranscript, refreshReview } from '../shared/review.js';
 import { AppError, validatePreferences } from './validation.js';
 export function atomicJson(path, value) { const tmp = path + '.' + randomUUID() + '.tmp'; writeFileSync(tmp, JSON.stringify(value, null, 2), { mode: 0o600, flag: 'wx' }); const fd = openSync(tmp, 'r'); try {
     fsyncSync(fd);
@@ -82,35 +83,44 @@ export class Store {
             this.assertOwned(job);
             for (const chunk of job.chunks) {
                 const raw = join(this.jobDir(job.id), 'responses', chunk.id + '.json');
-                if (chunk.status !== 'complete' && existsSync(raw)) {
+                if (existsSync(raw)) {
+                    // A durable raw response records a successful request, including a response with no text.
+                    // Recovery must never turn such a request back into queued billable work.
                     const saved = JSON.parse(readFileSync(raw, 'utf8'));
-                    if (typeof saved.text === 'string') {
-                        chunk.text = saved.text;
-                        chunk.status = 'complete';
-                        const last = chunk.attempts.at(-1);
-                        if (last) {
-                            last.outcome = 'success';
-                            last.endedAt = new Date().toISOString();
-                        }
+                    applyResponse(chunk, saved);
+                    const last = chunk.attempts.at(-1);
+                    if (last) {
+                        last.outcome = 'success';
+                        last.endedAt ??= new Date().toISOString();
                     }
+                }
+                else if (chunk.status === 'complete') {
+                    // Migrate older manifests that treated missing/whitespace text as ordinary completion.
+                    applyResponse(chunk, chunk.text === undefined ? {} : { text: chunk.text });
                 }
                 for (let i = 0; i < chunk.attempts.length; i++) {
                     const a = chunk.attempts[i];
-                    if (a.outcome === 'pending')
+                    if (a.outcome === 'pending') {
                         a.outcome = 'uncertain';
+                        if (!isChunkFinished(chunk))
+                            chunk.status = 'interrupted';
+                    }
                     this.ledger[`${job.id}/${chunk.id}/${i}`] = { estimatedUsd: a.estimatedUsd, outcome: a.outcome };
                 }
             }
-            if (['queued', 'preparing', 'uploading', 'transcribing', 'retrying'].includes(job.status)) {
+            if (['queued', 'preparing', 'analyzing', 'uploading', 'transcribing', 'retrying'].includes(job.status)) {
                 job.status = 'paused';
                 job.error = 'The app stopped before this lecture finished. Resume to continue. An interrupted request may still have been charged.';
             }
-            if (job.chunks.length && job.chunks.every(c => c.status === 'complete')) {
+            if (job.chunks.length && job.chunks.every(isChunkFinished)) {
                 job.status = 'complete';
                 job.partialText = '';
                 job.error = undefined;
             }
-            job.text = assemble(job);
+            else if (job.status === 'complete') {
+                job.status = 'paused';
+                job.error = 'This saved lecture still has unfinished audio sections. Resume to continue; its local audio has been kept.';
+            }
             this.jobs.set(job.id, job);
             this.save(job);
         }
@@ -133,6 +143,8 @@ export class Store {
         for (const chunk of job.chunks) {
             if (!chunk || typeof chunk.id !== 'string' || !/^chunk-\d{6}$/.test(chunk.id) || ids.has(chunk.id) || !Number.isInteger(chunk.index) || chunk.index < 0 || indices.has(chunk.index) || !Array.isArray(chunk.attempts))
                 throw unsafeManifest();
+            if (!Number.isFinite(chunk.start) || !Number.isFinite(chunk.end) || chunk.start < 0 || chunk.end <= chunk.start || !['pending', 'complete', 'no_text', 'failed', 'interrupted'].includes(chunk.status))
+                throw unsafeManifest();
             ids.add(chunk.id);
             indices.add(chunk.index);
             const extensions = ['wav', 'm4a', 'mp3', 'webm'];
@@ -145,7 +157,7 @@ export class Store {
     get(id) { const job = this.jobs.get(id); if (!job)
         throw new AppError('Lecture not found.', 404); return job; }
     list() { return [...this.jobs.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)); }
-    save(job) { mkdirSync(this.jobDir(job.id), { recursive: true, mode: 0o700 }); job.updatedAt = new Date().toISOString(); job.text = assemble(job); this.jobs.set(job.id, job); atomicJson(join(this.jobDir(job.id), 'manifest.json'), job); atomicText(join(this.jobDir(job.id), 'transcript.txt'), job.text); }
+    save(job) { mkdirSync(this.jobDir(job.id), { recursive: true, mode: 0o700 }); job.updatedAt = new Date().toISOString(); refreshReview(job); job.text = assembleTranscript(job); this.jobs.set(job.id, job); atomicJson(join(this.jobDir(job.id), 'manifest.json'), job); atomicText(join(this.jobDir(job.id), 'transcript.txt'), job.text); atomicText(join(this.jobDir(job.id), 'raw-transcript.txt'), rawTranscript(job)); }
     saveResponse(job, chunkId, response) { this.assertOwned(job); if (!job.chunks.some(chunk => chunk.id === chunkId))
         throw unsafeManifest(); const dir = join(this.jobDir(job.id), 'responses'); mkdirSync(dir, { recursive: true, mode: 0o700 }); atomicJson(join(dir, chunkId + '.json'), response); }
     record(job, chunkId, index, attempt) { this.ledger[`${job.id}/${chunkId}/${index}`] = { estimatedUsd: attempt.estimatedUsd, outcome: attempt.outcome }; atomicJson(join(this.dataDir, 'usage.json'), this.ledger); }
@@ -153,4 +165,3 @@ export class Store {
     savePreferences(prefs) { this.preferences = validatePreferences(prefs); atomicJson(join(this.dataDir, 'preferences.json'), this.preferences); return this.preferences; }
     remove(id) { this.assertOwned(this.get(id)); rmSync(this.jobDir(id), { recursive: true, force: true }); this.jobs.delete(id); }
 }
-export function assemble(job) { return [...job.chunks].sort((a, b) => a.index - b.index).filter(c => c.status === 'complete').map(c => c.text ?? '').join('\n\n'); }

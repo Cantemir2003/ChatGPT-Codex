@@ -159,11 +159,79 @@ try {
   assert.equal(await page.evaluate(() => localStorage.length), 0);
   assert.deepEqual(problems, [], 'No browser runtime or console errors expected.');
 
+  // Review workflow: three real audio sections, deliberately mocked sparse/empty responses.
+  // This must preserve all ranges, including the five-second tail, without extra API calls.
+  await page.evaluate(async fakeKey=>{
+    const boot=await(await fetch('/api/bootstrap')).json();
+    const headers={'content-type':'application/json','x-csrf-token':boot.csrfToken};
+    const saved=await fetch('/api/key',{method:'POST',headers,body:JSON.stringify({key:fakeKey})});
+    if(!saved.ok)throw new Error('Could not restore fixture key');
+    boot.preferences.app.chunkMinutes=1;
+    const settings=await fetch('/api/preferences',{method:'PUT',headers,body:JSON.stringify(boot.preferences)});
+    if(!settings.ok)throw new Error('Could not set fixture chunk duration');
+  },fakeKey);
+  await page.reload();
+  await page.getByLabel('Choose lecture recordings').setInputFiles(info.reviewRecording);
+  await page.getByText('Ready to transcribe',{exact:true}).last().waitFor();
+  await page.getByRole('button',{name:'Transcribe',exact:true}).click();
+  await page.waitForFunction(async()=>{
+    const jobs=await(await fetch('/api/jobs')).json();
+    return jobs.some(job=>job.filename==='review-fixture.wav'&&job.status==='complete');
+  },undefined,{timeout:30000});
+  await page.getByLabel('Transcript requiring review',{exact:true}).waitFor();
+  await page.waitForFunction(()=>document.querySelectorAll('.review-marker').length===3);
+  assert.equal(await page.locator('.transcript-badge').innerText(),'Review needed');
+  assert.match(await page.locator('.lecture-needs-review .lecture-meta').innerText(),/review needed/);
+  bootstrap=await page.evaluate(async()=>(await fetch('/api/bootstrap')).json());
+  const reviewed=bootstrap.jobs.find(job=>job.filename==='review-fixture.wav');
+  assert.deepEqual(reviewed.chunks.map(chunk=>chunk.status),['complete','no_text','no_text']);
+  assert.deepEqual(reviewed.chunks.map(chunk=>[chunk.start,chunk.end]),[[0,60],[60,120],[120,125]]);
+  assert.equal(reviewed.review.missingTextCount,2);assert.equal(reviewed.review.shortTextCount,1);
+  assert.equal(reviewed.audioAvailable,true,'Flagged audio must survive keepAudio=false cleanup.');
+  assert.equal(bootstrap.usage.requests,4,'One original request plus three reviewed sections; no quality retries.');
+  const reviewText=await page.getByLabel('Transcript requiring review',{exact:true}).innerText();
+  assert.match(reviewText,/Transcriere posibil incompletă/);assert.equal((reviewText.match(/FĂRĂ TRANSCRIERE/g)||[]).length,2);
+  assert(reviewText.includes('00:02:00–00:02:05'));assert(reviewText.includes('review-fixture.wav'));
+  await capture('review-light.png');
+
+  // Keyboard activation seeks the source recording and pauses at the selected interval's end.
+  const middle=page.getByRole('button',{name:'Play review interval 00:01:00–00:02:00 for review-fixture.wav',exact:true});
+  await middle.focus();await page.keyboard.press('Enter');
+  await page.getByLabel('Selected review interval').waitFor();
+  await page.waitForFunction(()=>{const audio=document.querySelector('audio');return audio&&audio.currentTime>=60&&audio.currentTime<64;});
+  assert.equal(await page.locator('audio').evaluate(audio=>audio.paused),false);
+  await page.locator('audio').evaluate(audio=>{audio.currentTime=120.1;audio.dispatchEvent(new Event('timeupdate'));});
+  await page.waitForFunction(()=>document.querySelector('audio')?.paused===true);
+  assert.equal(await page.locator('audio').evaluate(audio=>audio.currentTime),120);
+  const exported=await context.request.get(`${info.url}/api/jobs/${reviewed.id}/export`);
+  assert.equal(await exported.text(),reviewed.text);
+  await page.getByRole('button',{name:'Copy all',exact:true}).click();
+  await page.getByRole('button',{name:'Copied',exact:true}).waitFor();
+  await page.reload();
+  await page.getByLabel('Transcript requiring review',{exact:true}).waitFor();
+  assert.equal(await page.locator('.review-marker').count(),3);
+  assert.match(await page.locator('.lecture-needs-review .lecture-meta').innerText(),/review needed/);
+  const afterReview=await page.evaluate(async id=>{
+    const boot=await(await fetch('/api/bootstrap')).json();
+    const job=boot.jobs.find(item=>item.id===id);
+    const response=await fetch(`/api/jobs/${id}/start`,{method:'POST',headers:{'content-type':'application/json','x-csrf-token':boot.csrfToken},body:JSON.stringify({settings:job.settings,appSettings:job.appSettings})});
+    if(!response.ok)throw new Error('Restart guard failed');
+    return (await fetch('/api/bootstrap')).json();
+  },reviewed.id);
+  assert.equal(afterReview.usage.requests,4,'Opening review markers/reloading/starting a finished review must not retranscribe.');
+  await page.getByRole('button',{name:'App settings',exact:true}).click();
+  await page.getByRole('button',{name:'Dark',exact:true}).click();
+  await page.getByRole('button',{name:'Save settings',exact:true}).click();
+  await page.getByRole('button',{name:'Settings saved',exact:true}).waitFor();
+  await page.getByRole('button',{name:'Close dialog'}).click();
+  await capture('review-dark.png');
+  assert.deepEqual(problems,[],'Review workflow must not produce browser runtime/console errors.');
+
   // A narrow-screen sanity check supplements the requested MacBook viewport.
   await page.setViewportSize({ width: 390, height: 844 });
   assert.equal(await page.locator('html').evaluate(node => node.scrollWidth <= window.innerWidth), true);
   await capture('mocked-transcript-mobile.png');
-  console.log('UI checks passed: actual import/inspection, explicit start, mocked transcription, UTF-8 export, recovery on refresh, search, presets, theme, key save/removal, audio cleanup, and responsive layout.');
+  console.log('UI checks passed: actual import/inspection, explicit start, mocked transcription, UTF-8 export, refresh, search, presets, theme, key save/removal, cleanup, empty/sparse/final-tail review markers, retained audio, keyboard interval playback/end stop, no added requests, and responsive layout.');
   console.log('Screenshots saved in work/screenshots. Transcription screenshots use synthetic audio and explicitly mocked API output.');
 } finally {
   if (browser) await browser.close();

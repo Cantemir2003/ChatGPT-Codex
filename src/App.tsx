@@ -1,11 +1,15 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import type { AppSettings, Bootstrap, Job, JobStatus, Preferences, TranscriptionSettings } from '../shared/types';
+import { useCallback, useEffect, useImperativeHandle, useRef, useState, type ReactNode, type Ref } from 'react';
+import type { AppSettings, Bootstrap, Chunk, Job, JobStatus, Preferences, TranscriptionSettings } from '../shared/types';
 import { DEFAULTS, MODEL } from '../shared/config';
+import { chunkAnnotation, countWords, formatTimestamp, isChunkFinished, REVIEW_EXPLANATION } from '../shared/review';
 
-type IconName = 'wave'|'plus'|'upload'|'file'|'settings'|'chevron'|'arrow'|'search'|'copy'|'download'|'close'|'check'|'shield'|'key'|'sun'|'moon'|'monitor'|'stop'|'trash'|'refresh'|'external'|'headphones';
+type IconName = 'wave'|'plus'|'upload'|'file'|'settings'|'chevron'|'arrow'|'search'|'copy'|'download'|'close'|'check'|'shield'|'key'|'sun'|'moon'|'monitor'|'stop'|'trash'|'refresh'|'external'|'headphones'|'warning'|'play'|'pause';
 function Icon({ name, size = 20, ...props }: { name: IconName; size?: number; className?: string }) {
   const paths: Record<IconName, ReactNode> = {
     wave: <path d="M4 10v4m4-8v12m4-15v18m4-15v12m4-8v4" />,
+    warning: <><path d="m12 3 10 18H2Z"/><path d="M12 9v5m0 3h.01"/></>,
+    play: <path d="m8 4 12 8-12 8Z"/>,
+    pause: <><path d="M8 4v16M16 4v16"/></>,
     plus: <path d="M12 5v14M5 12h14" />,
     upload: <><path d="M12 16V3m-5 5 5-5 5 5M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4" /></>,
     file: <><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Zm0 0v6h6M8 13h8m-8 4h6" /></>,
@@ -31,17 +35,113 @@ function Icon({ name, size = 20, ...props }: { name: IconName; size?: number; cl
   return <svg {...props} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
 }
 
-const ACTIVE = new Set<JobStatus>(['queued','preparing','uploading','transcribing','retrying']);
+const ACTIVE = new Set<JobStatus>(['queued','preparing','analyzing','uploading','transcribing','retrying']);
 const STARTABLE = new Set<JobStatus>(['ready','paused','failed','cancelled']);
-const STATUS: Record<JobStatus,string> = { ready:'Ready to transcribe',queued:'In queue',preparing:'Preparing audio',uploading:'Sending audio / waiting for transcript',transcribing:'Transcribing',retrying:'Waiting to retry',paused:'Paused · ready to resume',failed:'Needs attention',cancelled:'Cancelled · work saved',complete:'Complete' };
+const STATUS: Record<JobStatus,string> = { ready:'Ready to transcribe',queued:'In queue',preparing:'Preparing audio',analyzing:'Analyzing speech locally',uploading:'Sending audio / waiting for transcript',transcribing:'Transcribing',retrying:'Waiting to retry',paused:'Paused · ready to resume',failed:'Needs attention',cancelled:'Cancelled · work saved',complete:'Complete' };
 const LANGUAGES = [{code:'ro',label:'Romanian'}, {code:'en',label:'English'}, {code:'fr',label:'French'}, {code:'de',label:'German'}, {code:'es',label:'Spanish'}, {code:'it',label:'Italian'}];
 const ACCEPT = '.m4a,.mp3,.mp4,.wav,.flac,.ogg,.opus,.aac,.aif,.aiff,.webm,.mov,.wma,audio/*';
 const money = (amount: number) => amount < 0.01 && amount > 0 ? '< $0.01' : `$${amount.toFixed(2)}`;
 const duration = (seconds: number) => seconds < 60 ? `${Math.round(seconds)} sec` : seconds < 3600 ? `${Math.floor(seconds/60)} min ${Math.round(seconds%60)} sec` : `${Math.floor(seconds/3600)} hr ${Math.round(seconds%3600/60)} min`;
 const size = (bytes: number) => bytes < 1_000_000 ? `${Math.round(bytes/1000)} KB` : `${(bytes/1_000_000).toFixed(1)} MB`;
-const transcript = (job: Job | undefined) => job ? [job.text, job.partialText].filter(Boolean).join(job.text && job.partialText ? '\n\n' : '') : '';
 const cloneDefaults = () => structuredClone(DEFAULTS);
 const normalizeSettings = (settings: TranscriptionSettings): TranscriptionSettings => ({ ...settings, keywords: settings.keywords.map(term => term.trim()).filter(Boolean) });
+
+const needsReview = (job: Job) => !!job.review?.needsReview || job.chunks.some(chunk=>chunk.status==='no_text'||chunk.review?.kind==='short_text');
+const rangeLabel = (chunk: Pick<Chunk,'start'|'end'>) => `${formatTimestamp(chunk.start)}–${formatTimestamp(chunk.end)}`;
+function reviewEvidence(chunk: Chunk): string {
+  const seconds=(chunk.end-chunk.start).toFixed(1).replace(/\.0$/,'');
+  const review=chunk.review;
+  const words=review?.wordCount??countWords(chunk.text??'');
+  const basis=review?.basis==='speech'
+    ? `${(review.speechSeconds??0).toFixed(1).replace(/\.0$/,'')} s of locally detected speech`
+    : 'duration-only check; speech analysis unavailable';
+  const rate=review?.wordsPerMinute===undefined?'':` · ${review.wordsPerMinute.toFixed(1)} words/min`;
+  return `${words} words · ${seconds} s section · ${basis}${rate}`;
+}
+type TranscriptSegment={text:string;chunk?:Chunk;draft?:boolean};
+/** Replace only app-generated annotations, preserving every character of the saved text. */
+function transcriptSegments(job: Job | undefined): TranscriptSegment[] {
+  if(!job)return [];
+  const segments:TranscriptSegment[]=[];
+  let cursor=0,sectionOffset=0,draftInserted=false;
+  const unfinished=[...job.chunks].sort((a,b)=>a.index-b.index).find(chunk=>!isChunkFinished(chunk));
+  for(const chunk of [...job.chunks].sort((a,b)=>a.index-b.index)) {
+    const annotation=chunkAnnotation(job,chunk);
+    const section=[annotation,chunk.status==='complete'?chunk.text:undefined].filter(value=>value!==undefined).join('\n');
+    const position=sectionOffset;
+    sectionOffset+=section.length+2;
+    // Match only the structural start of this section. Identical text spoken in
+    // an earlier section remains ordinary transcript text, never an app marker.
+    if(!annotation||job.text.slice(position,position+annotation.length)!==annotation)continue;
+    if(position>cursor)segments.push({text:job.text.slice(cursor,position)});
+    segments.push({text:annotation,chunk});
+    if(job.partialText&&unfinished?.id===chunk.id){segments.push({text:job.partialText,chunk,draft:true});draftInserted=true;}
+    cursor=position+annotation.length;
+  }
+  if(cursor<job.text.length)segments.push({text:job.text.slice(cursor)});
+  if(job.partialText&&!draftInserted)segments.push({text:job.partialText,chunk:unfinished,draft:true});
+  return segments;
+}
+
+type PlaybackRange={jobId:string;chunkId:string;start:number;end:number;request:number};
+type ReviewPlayerHandle={playRange:(range:PlaybackRange)=>void};
+function ReviewPlayer({job,range,onClear,playerRef}:{job:Job;range?:PlaybackRange;onClear:()=>void;playerRef:Ref<ReviewPlayerHandle>}) {
+  const audioRef=useRef<HTMLAudioElement>(null);
+  const pending=useRef(false);
+  const rangeRef=useRef(range);rangeRef.current=range;
+  const [playing,setPlaying]=useState(false);
+  const [clock,setClock]=useState(0);
+  const [error,setError]=useState('');
+  const playSelected=useCallback(async()=>{
+    const audio=audioRef.current,current=rangeRef.current;
+    if(!audio||!current)return;
+    try {
+      pending.current=audio.readyState<1;
+      if(!pending.current)audio.currentTime=current.start;
+      // Call play directly from the user's click, including before metadata loads.
+      // This preserves Safari's media activation permission.
+      await audio.play();
+      if(rangeRef.current?.request!==current.request)audio.pause();
+    } catch {setError('Playback could not start. Press Play interval to try again, or open your original recording at the times shown.');}
+  },[]);
+  useImperativeHandle(playerRef,()=>({playRange:next=>{
+    rangeRef.current=next;setError('');audioRef.current?.pause();
+    void playSelected();
+  }}),[playSelected]);
+  useEffect(()=>{
+    const audio=audioRef.current;audio?.pause();setPlaying(false);setError('');pending.current=false;
+  },[job.id,job.audioAvailable]);
+  const stopAtEnd=useCallback(()=>{
+    const audio=audioRef.current,current=rangeRef.current;
+    if(audio&&current&&audio.currentTime>=current.end&&!audio.paused){audio.pause();audio.currentTime=current.end;setPlaying(false);}
+  },[]);
+  useEffect(()=>{
+    const audio=audioRef.current;
+    if(!audio||!range||!playing)return;
+    let frame=0;
+    const tick=()=>{stopAtEnd();frame=requestAnimationFrame(tick);};
+    frame=requestAnimationFrame(tick);
+    // The timer supplements timeupdate/animation frames when the tab is in the background.
+    const timer=window.setTimeout(()=>{if(audio.currentTime>=range.end-.04){audio.pause();audio.currentTime=range.end;setPlaying(false);}},Math.max(0,(range.end-audio.currentTime)/audio.playbackRate*1000));
+    return()=>{cancelAnimationFrame(frame);clearTimeout(timer);};
+  },[range,playing,clock,stopAtEnd]);
+  return <>
+    {job.audioAvailable?<audio ref={audioRef} key={job.id} controls preload="metadata" src={`/api/jobs/${job.id}/audio`} aria-label={`Preview ${job.filename}`}
+      onLoadedMetadata={()=>{if(pending.current&&audioRef.current&&rangeRef.current){pending.current=false;audioRef.current.currentTime=rangeRef.current.start;setClock(value=>value+1);}}}
+      onPlay={()=>{setPlaying(true);setClock(value=>value+1);}}
+      onPause={()=>setPlaying(false)} onEnded={()=>setPlaying(false)}
+      onTimeUpdate={stopAtEnd} onSeeked={()=>{setClock(value=>value+1);stopAtEnd();}} onRateChange={()=>setClock(value=>value+1)}
+      onError={()=>{pending.current=false;setError('The working audio could not be opened. Open your original recording at the displayed interval; your original file is untouched.');}}/>
+      :<p className="audio-unavailable">Working audio is unavailable. Your original recording is untouched. To review an interval, open the original file and use the times shown below.</p>}
+    {range&&<div className="review-player-range" aria-label="Selected review interval">
+      <div><strong role="status">{playing?'Playing review interval':'Review interval'}</strong><span>{rangeLabel(range)}</span><small>{job.filename}</small></div>
+      {job.audioAvailable&&<button className="button secondary small" onClick={()=>{if(playing)audioRef.current?.pause();else void playSelected();}}><Icon name={playing?'pause':'play'} size={14}/>{playing?'Pause':'Play interval'}</button>}
+      <button className="text-button" onClick={()=>{audioRef.current?.pause();pending.current=false;onClear();}}>Clear interval</button>
+      <p>Playback uses the full section boundaries and pauses at the end. The position of any missing words within the section is unknown.</p>
+    </div>}
+    {error&&<p className="review-audio-error" role="status">{error}</p>}
+  </>;
+}
 
 function Dialog({ title, onClose, children, className='' }: {title:string;onClose:()=>void;children:ReactNode;className?:string}) {
   const ref = useRef<HTMLDivElement>(null);
@@ -89,6 +189,8 @@ export default function App() {
   const [deleteId,setDeleteId] = useState<string>();
   const [stopOpen,setStopOpen] = useState(false);
   const [stopped,setStopped] = useState(false);
+  const [playbackRange,setPlaybackRange] = useState<PlaybackRange>();
+  const reviewPlayerRef=useRef<ReviewPlayerHandle>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const transcriptRef = useRef<HTMLDivElement>(null);
   const bootRef = useRef(boot);
@@ -144,17 +246,34 @@ export default function App() {
     return ()=>{disposed=true;window.clearInterval(timer);};
   },[active,!!boot,stopped,request,refresh]);
   useEffect(()=>{if(notice?.type==='success'){const timer=setTimeout(()=>setNotice(undefined),5000);return()=>clearTimeout(timer);}},[notice]);
-  useEffect(()=>{setSearch('');setSearchIndex(0);},[selectedId]);
+  useEffect(()=>{setSearch('');setSearchIndex(0);setPlaybackRange(undefined);},[selectedId]);
   const selected = jobs.find(job=>job.id===selectedId);
-  const text = transcript(selected);
+  const text = selected?.text ?? '';
+  const segments = transcriptSegments(selected);
+  const flagged = selected ? needsReview(selected) : false;
+  const reviewChunks = selected?.chunks.filter(chunk=>chunk.status==='no_text'||chunk.review?.kind==='short_text').sort((a,b)=>a.index-b.index) ?? [];
+  const orderedChunks = [...(selected?.chunks??[])].sort((a,b)=>a.index-b.index);
+  const finished = orderedChunks.filter(isChunkFinished).length;
   const selectedJobs = jobs.filter(job=>checked.has(job.id) && STARTABLE.has(job.status));
   const readyJobs = jobs.filter(job=>job.status==='ready');
   const batch = selectedJobs.length ? selectedJobs : readyJobs;
   const estimate = batch.reduce((sum,job)=>sum+job.estimatedUsd,0);
   const completed = selected?.chunks.filter(chunk=>chunk.status==='complete').length ?? 0;
+  const noTextCount = selected?.chunks.filter(chunk=>chunk.status==='no_text').length ?? 0;
   const query = search.trim();
-  const parts = query ? text.split(new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')})`,'gi')) : [text];
-  const matches = query ? Math.floor(parts.length/2) : 0;
+  const splitSearch = (value:string) => query ? value.split(new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')})`,'gi')) : [value];
+  const matches = query ? segments.reduce((sum,segment)=>sum+Math.floor(splitSearch(segment.text).length/2),0) : 0;
+  let matchIndex=0;
+  const highlighted = (value:string) => splitSearch(value).map((part,index)=>{
+    if(!query||index%2===0)return part;
+    const current=matchIndex++;
+    return <mark key={index} data-match={current} className={current===searchIndex?'current-match':''}>{part}</mark>;
+  });
+  function playReviewInterval(chunk:Chunk) {
+    if(!selected||!Number.isFinite(chunk.start)||!Number.isFinite(chunk.end)||chunk.end<=chunk.start)return;
+    const range={jobId:selected.id,chunkId:chunk.id,start:chunk.start,end:chunk.end,request:performance.now()};
+    setPlaybackRange(range);reviewPlayerRef.current?.playRange(range);
+  }
   useEffect(()=>{setSearchIndex(0);},[query]);
   useEffect(()=>{transcriptRef.current?.querySelector<HTMLElement>(`[data-match="${searchIndex}"]`)?.scrollIntoView({block:'nearest',behavior:'smooth'});},[searchIndex,query]);
 
@@ -254,9 +373,9 @@ export default function App() {
       <button className="button primary new-lecture" disabled={!!importing || !boot.ffmpegAvailable} onClick={()=>fileRef.current?.click()}><Icon name="plus" size={18}/> Add recording</button>
       <div className="library-heading"><h2>Your lectures</h2><span>{jobs.length}</span></div>
       <nav className="lecture-list" aria-label="Saved lectures">
-        {jobs.length===0 ? <div className="library-empty"><Icon name="file" size={24}/><p>A place for every lecture.</p><span>Your recordings will appear here.</span></div> : jobs.map(job=><div key={job.id} className={`lecture-item ${selectedId===job.id?'selected':''}`}>
+        {jobs.length===0 ? <div className="library-empty"><Icon name="file" size={24}/><p>A place for every lecture.</p><span>Your recordings will appear here.</span></div> : jobs.map(job=><div key={job.id} className={`lecture-item ${selectedId===job.id?'selected':''} ${needsReview(job)?'lecture-needs-review':''}`}>
           {STARTABLE.has(job.status) && <input type="checkbox" checked={checked.has(job.id)} aria-label={`Select ${job.filename} for transcription`} onChange={event=>setChecked(current=>{const next=new Set(current);event.target.checked?next.add(job.id):next.delete(job.id);return next;})}/>}
-          <button className="lecture-select" onClick={()=>setSelectedId(job.id)}><span className="lecture-name">{job.filename}</span><span className="lecture-meta"><span className={`status-dot ${job.status}`}/>{job.status==='complete'?duration(job.audio.duration):STATUS[job.status]}</span></button>
+          <button className="lecture-select" onClick={()=>setSelectedId(job.id)}><span className="lecture-name">{job.filename}</span><span className={`lecture-meta ${needsReview(job)?'review-meta':''}`}>{needsReview(job)?<Icon name="warning" size={12}/>:<span className={`status-dot ${job.status}`}/>} {needsReview(job)?(job.status==='complete'?'Finished · review needed':`${STATUS[job.status]} · review needed`):job.status==='complete'?duration(job.audio.duration):STATUS[job.status]}</span></button>
         </div>)}
       </nav>
       {batch.length>0 && <div className="queue-action"><div><span>{selectedJobs.length?'Selected':'Ready'} · {batch.length} {batch.length===1?'lecture':'lectures'}</span><strong>~ {money(estimate)}</strong></div><button className="button primary" disabled={busy||!boot.ffmpegAvailable} onClick={()=>void startJobs(batch)}><Icon name="wave" size={17}/>{selectedJobs.length?'Transcribe selected':'Transcribe all ready'}</button><p>Processed one at a time.</p></div>}
@@ -268,18 +387,37 @@ export default function App() {
         {(notice || connectionError) && <div className={`notice ${connectionError||notice?.type==='error'?'error':'success'}`} role={connectionError||notice?.type==='error'?'alert':'status'}><span>{connectionError||notice?.text}</span><button className="icon-button" aria-label="Dismiss message" onClick={()=>{setNotice(undefined);setConnectionError('');}}><Icon name="close" size={16}/></button></div>}
         {!boot.ffmpegAvailable && <div className="notice error" role="alert"><span><strong>Audio tools need to be installed.</strong> FFmpeg and ffprobe were not found. Follow the first-time setup instructions, then restart the app.</span></div>}
         <div className="page-heading"><div><span className="eyebrow">A LITTLE MORE CLARITY</span><h1>{selected?selected.filename.replace(/\.[^.]+$/,''):'Focus on the lecture. We’ll keep the words.'}</h1><p>{selected?'Original spoken words. Ready to read, search, and keep.':'Turn your recordings into readable text, in the language they were spoken.'}</p></div>{selected&&<button className="icon-button delete-button" title="Delete from app history" aria-label={`Delete ${selected.filename} from app history`} onClick={()=>setDeleteId(selected.id)} disabled={ACTIVE.has(selected.status)}><Icon name="trash" size={19}/></button>}</div>
-        {!selected ? <section className={`upload-card ${importing?'is-importing':''}`} aria-label="Add an audio recording"><div className="upload-visual"><Icon name="upload" size={28}/><span className="upload-orbit"/></div><div className="upload-content"><h2>{importing?'Getting your recording ready…':'Start with a recording'}</h2><p>{importing||'Drop your audio here, or choose a file from your Mac.'}</p><span>Voice Memos M4A · MP3 · WAV · FLAC and more</span></div><button className="button primary" onClick={()=>fileRef.current?.click()} disabled={!!importing||!boot.ffmpegAvailable}>{importing?<span className="spinner"/>:<Icon name="plus" size={18}/>}Choose audio</button><div className="upload-footer"><Icon name="shield" size={14}/>Files stay local until you choose Transcribe.</div></section> : <section className="audio-card" aria-label="Recording details"><div className="audio-file-icon"><Icon name="wave" size={25}/></div><div className="audio-details"><strong title={selected.filename}>{selected.filename}</strong><div><span>{duration(selected.audio.duration)}</span><span>{size(selected.audio.size)}</span><span>{selected.audio.codec.toUpperCase()} · {selected.audio.channels===1?'Mono':`${selected.audio.channels} channels`}</span></div></div><div className="audio-cost"><span>Estimated cost</span><strong>~ {money(selected.estimatedUsd)}</strong></div>{selected.audioAvailable?<audio key={selected.id} controls preload="metadata" src={`/api/jobs/${selected.id}/audio`} aria-label={`Preview ${selected.filename}`}/>:<p className="audio-unavailable">Temporary audio was cleaned up. Your transcript is saved; your original file is untouched.</p>}</section>}
+        {!selected ? <section className={`upload-card ${importing?'is-importing':''}`} aria-label="Add an audio recording"><div className="upload-visual"><Icon name="upload" size={28}/><span className="upload-orbit"/></div><div className="upload-content"><h2>{importing?'Getting your recording ready…':'Start with a recording'}</h2><p>{importing||'Drop your audio here, or choose a file from your Mac.'}</p><span>Voice Memos M4A · MP3 · WAV · FLAC and more</span></div><button className="button primary" onClick={()=>fileRef.current?.click()} disabled={!!importing||!boot.ffmpegAvailable}>{importing?<span className="spinner"/>:<Icon name="plus" size={18}/>}Choose audio</button><div className="upload-footer"><Icon name="shield" size={14}/>Files stay local until you choose Transcribe.</div></section> : <section className="audio-card" aria-label="Recording details"><div className="audio-file-icon"><Icon name="wave" size={25}/></div><div className="audio-details"><strong title={selected.filename}>{selected.filename}</strong><div><span>{duration(selected.audio.duration)}</span><span>{size(selected.audio.size)}</span><span>{selected.audio.codec.toUpperCase()} · {selected.audio.channels===1?'Mono':`${selected.audio.channels} channels`}</span></div></div><div className="audio-cost"><span>Estimated cost</span><strong>~ {money(selected.estimatedUsd)}</strong></div><ReviewPlayer playerRef={reviewPlayerRef} job={selected} range={playbackRange?.jobId===selected.id?playbackRange:undefined} onClear={()=>setPlaybackRange(undefined)}/></section>}
 
         <section className={`setup-panel ${setupOpen?'expanded':''}`}>
           <button className="setup-summary" onClick={()=>setSetupOpen(!setupOpen)} aria-expanded={setupOpen} aria-controls="transcription-settings"><span className="setup-heading"><Icon name="settings" size={18}/><strong>Transcription settings</strong></span><span className="setup-preview">{preferences.transcription.languages.length?preferences.transcription.languages.map(code=>LANGUAGES.find(lang=>lang.code===code)?.label??code.toUpperCase()).join(', '):'Auto-detect language'}<span>·</span>{preferences.transcription.stream?'Live text on':'Live text off'}</span><code>{MODEL}</code><Icon name="chevron" size={14} className="setup-chevron"/></button>
           {setupOpen&&<div id="transcription-settings" className="setup-fields"><div className="settings-intro"><p>These settings apply to new transcriptions. Resuming a lecture uses its saved settings.</p><button className="text-button" onClick={()=>{setPreferences(current=>({...current,transcription:structuredClone(DEFAULTS.transcription)}));setSaved(false);}}>Reset to defaults</button></div><div className="settings-grid"><div className="field"><label htmlFor="languages">Expected languages</label><div className="language-options"><label className={`language-chip ${preferences.transcription.languages.length===0?'chosen':''}`}><input type="checkbox" checked={preferences.transcription.languages.length===0} onChange={event=>changeTranscription({languages:event.target.checked?[]:['ro']})}/>Automatic</label>{LANGUAGES.map(lang=><label key={lang.code} className={`language-chip ${preferences.transcription.languages.includes(lang.code)?'chosen':''}`}><input type="checkbox" checked={preferences.transcription.languages.includes(lang.code)} onChange={event=>changeTranscription({languages:event.target.checked?[...preferences.transcription.languages,lang.code]:preferences.transcription.languages.filter(code=>code!==lang.code)})}/>{lang.label}</label>)}</div><input id="languages" aria-label="Expected language codes" key={preferences.transcription.languages.join(',')} defaultValue={preferences.transcription.languages.join(', ')} onBlur={event=>changeTranscription({languages:event.target.value.split(',').map(code=>code.trim().toLowerCase()).filter(Boolean)})} placeholder="Other ISO codes, separated by commas"/><span className="field-help">Use two-letter language codes. Automatic leaves out the language hint. Audio is never translated.</span></div><div className="field"><label htmlFor="context">Recording context</label><textarea id="context" maxLength={12000} value={preferences.transcription.prompt} onChange={event=>changeTranscription({prompt:event.target.value})} rows={3}/><span className="field-help">Briefly describe the lecture’s subject. This app allows up to 12,000 characters; the API may reject long context earlier.</span></div><div className="field"><label htmlFor="keywords">Vocabulary <span className="optional">Optional</span></label><textarea id="keywords" placeholder="Add a term on each line" rows={3} value={preferences.transcription.keywords.join('\n')} onChange={event=>changeTranscription({keywords:event.target.value.split('\n')})}/><span className="field-help">Names or specialist terms used in this lecture. One term per line; angle brackets are not allowed.</span></div><div className="field"><label className="toggle-label"><span><strong>Display text as it arrives</strong><small>Show streamed text while each section is transcribed.</small></span><input role="switch" className="switch" type="checkbox" checked={preferences.transcription.stream} onChange={event=>changeTranscription({stream:event.target.checked})}/></label><div className="preset-select"><label htmlFor="preset">Saved presets</label><select id="preset" defaultValue="" onChange={event=>{const preset=preferences.presets.find(item=>item.name===event.target.value);if(preset)changeTranscription(structuredClone(preset.settings));event.target.value='';}}><option value="" disabled>{preferences.presets.length?'Choose a preset':'No saved presets yet'}</option>{preferences.presets.map(preset=><option key={preset.name}>{preset.name}</option>)}</select></div></div></div><div className="settings-actions"><div className="preset-new"><input aria-label="Preset name" placeholder="Name this preset…" value={presetName} maxLength={80} onChange={event=>setPresetName(event.target.value)} onKeyDown={event=>{if(event.key==='Enter')addPreset();}}/><button className="button secondary small" disabled={!presetName.trim()} onClick={addPreset}>Save preset</button></div><button className="button primary small" onClick={()=>void savePreferences()}><Icon name={saved?'check':'settings'} size={16}/>{saved?'Settings saved':'Save settings'}</button></div></div>}
         </section>
 
-        {selected && <section className="job-actions" aria-label="Transcription progress"><div><span className={`status-pill ${selected.status}`}><span className={`status-dot ${selected.status}`}/>{STATUS[selected.status]}</span>{selected.chunks.length>0&&<span className="section-progress">{completed} of {selected.chunks.length} sections complete</span>}</div>{STARTABLE.has(selected.status)&&<button className="button primary" disabled={busy||!boot.ffmpegAvailable} onClick={()=>void startJobs([selected])}><Icon name={selected.status==='ready'?'wave':'refresh'} size={18}/>{selected.status==='ready'?'Transcribe':'Resume unfinished sections'}<Icon name="arrow" size={16}/></button>}{ACTIVE.has(selected.status)&&<button className="button secondary small" onClick={()=>void cancelJob(selected)} disabled={busy}><Icon name="stop" size={15}/>Cancel</button>}{selected.status==='ready'&&<p className="job-disclosure">Starting sends this recording to OpenAI. The estimate uses measured audio duration.</p>}{ACTIVE.has(selected.status)&&<p className="job-disclosure">{selected.status==='retrying'?'A temporary API error occurred. The app is waiting before its next attempt.':'Completed sections are saved as they finish.'} Cancelling may still incur a charge for the current request.</p>}{['failed','paused','cancelled'].includes(selected.status)&&<p className="job-disclosure">Completed sections are preserved. Resuming sends only unfinished sections; interrupted requests may have been charged.</p>}{selected.error&&<div className="job-error" role="alert">{selected.error}</div>}</section>}
+        {selected && <section className="job-actions" aria-label="Transcription progress">
+          <div><span className={`status-pill ${flagged?'needs-review':selected.status}`}><span className={`status-dot ${flagged?'needs-review':selected.status}`}/>{selected.status==='complete'&&flagged?'Finished · review needed':STATUS[selected.status]}</span>
+            {selected.chunks.length>0&&<span className="section-progress">{finished} of {selected.chunks.length} sections processed · {completed} with text{noTextCount>0?` · ${noTextCount} without text`:''}</span>}
+          </div>
+          {STARTABLE.has(selected.status)&&(selected.status==='ready'||!selected.chunks.length||selected.chunks.some(chunk=>!isChunkFinished(chunk)))&&<button className="button primary" disabled={busy||!boot.ffmpegAvailable} onClick={()=>void startJobs([selected])}><Icon name={selected.status==='ready'?'wave':'refresh'} size={18}/>{selected.status==='ready'?'Transcribe':'Resume unfinished sections'}<Icon name="arrow" size={16}/></button>}
+          {ACTIVE.has(selected.status)&&<button className="button secondary small" onClick={()=>void cancelJob(selected)} disabled={busy}><Icon name="stop" size={15}/>Cancel</button>}
+          {selected.status==='ready'&&<p className="job-disclosure">Starting sends this recording to OpenAI. The estimate uses measured audio duration.</p>}
+          {ACTIVE.has(selected.status)&&<p className="job-disclosure">{selected.status==='analyzing'?'Speech activity is being analyzed locally. This check does not send audio to an API, remove audio, or determine whether every word was transcribed.':`${selected.status==='retrying'?'A temporary API error occurred. The app is waiting before its next attempt.':'Finished sections are saved as they finish.'} Cancelling may still incur a charge for the current request.`}</p>}
+          {['failed','paused','cancelled'].includes(selected.status)&&<p className="job-disclosure">Resuming sends only unfinished sections. Saved text and sections that returned no text are preserved and are not automatically resent. Interrupted requests may have been charged.</p>}
+          {selected.error&&<div className="job-error" role="alert">{selected.error}</div>}
+        </section>}
+        {selected&&(flagged||selected.status==='complete')&&<section className={`review-summary ${flagged?'has-warnings':'review-information'}`} aria-label="Recording review">
+          <div className="review-summary-heading"><Icon name={flagged?'warning':'headphones'} size={20}/><div><h2>{flagged?'Review this recording':'About the review checks'}</h2><p className="review-source">{selected.filename}</p></div>{flagged&&<span className="review-count">{reviewChunks.length} flagged {reviewChunks.length===1?'section':'sections'}</span>}</div>
+          {reviewChunks.length>0&&<p className="review-counts">{noTextCount>0?`${noTextCount} ${noTextCount===1?'section returned':'sections returned'} no text. `:''}{reviewChunks.filter(chunk=>chunk.review?.kind==='short_text').length>0?`${reviewChunks.filter(chunk=>chunk.review?.kind==='short_text').length} ${reviewChunks.filter(chunk=>chunk.review?.kind==='short_text').length===1?'section has':'sections have'} unusually little text. `:''}Listen to the full intervals below; these are prompts to review, not confirmed omissions.</p>}
+          {(selected.review?.analysisUnavailable||selected.review?.analysisNotRun)&&<p className="analysis-unavailable"><strong>{selected.review.analysisNotRun?'Local speech analysis was not run.':'Local speech analysis is unavailable.'}</strong> {selected.speech?.reason||'The review uses full section duration where speech evidence is unavailable.'} A nonempty result does not prove that the entire recording was transcribed.</p>}
+          {reviewChunks.length>0&&<ul className="review-interval-list">{reviewChunks.map(chunk=><li key={chunk.id}><button className={`review-interval ${playbackRange?.chunkId===chunk.id?'selected-interval':''}`} onClick={()=>playReviewInterval(chunk)} aria-label={`Play review interval ${rangeLabel(chunk)} for ${selected.filename}`} aria-pressed={playbackRange?.chunkId===chunk.id}><Icon name="play" size={15}/><span><strong>{rangeLabel(chunk)}<span>{chunk.status==='no_text'?'No text returned':'Possibly incomplete'}</span></strong><small>{reviewEvidence(chunk)}</small></span></button></li>)}</ul>}
+          {reviewChunks.length>0&&<p className="review-playback-help">{selected.audioAvailable?'Choose an interval to play the saved recording. Playback stops at the section’s end; this does not call OpenAI.':'Working audio is unavailable. Open your original recording and listen at the exact times shown. Review links still identify the relevant interval.'}</p>}
+          <p className="review-explanation" lang="ro">{REVIEW_EXPLANATION}</p>
+          <p className="review-export-note">App annotations are included in Copy all and TXT exports. The original returned text is unchanged; unfinished live text is excluded.</p>
+        </section>}
         {importing && selected && <div className="import-status" role="status"><span className="spinner"/>{importing}</div>}
 
-        <section className="transcript-card" aria-label="Transcript"><div className="transcript-toolbar"><div className="transcript-title"><Icon name="file" size={18}/><h2>Transcript</h2>{text&&<span className={`transcript-badge ${selected?.status==='complete'?'complete':''}`}>{selected?.status==='complete'?'Complete':'Partial'}</span>}</div><div className="transcript-tools"><div className="font-controls"><button onClick={()=>void savePreferences({...preferences,app:{...preferences.app,fontSize:Math.max(14,preferences.app.fontSize-1)}})} disabled={preferences.app.fontSize<=14} aria-label="Decrease transcript font size">A−</button><button onClick={()=>void savePreferences({...preferences,app:{...preferences.app,fontSize:Math.min(26,preferences.app.fontSize+1)}})} disabled={preferences.app.fontSize>=26} aria-label="Increase transcript font size">A+</button></div><span className="toolbar-divider"/><button className="tool-button" title="Copy all visible text, including any live text from the current section" disabled={!text} onClick={()=>void copyText()}><Icon name={copied?'check':'copy'} size={16}/><span>{copied?'Copied':'Copy all'}</span></button>{text&&selected?<a className="tool-button export-button" title="Download saved completed sections. Live text from the unfinished section is excluded." href={`/api/jobs/${selected.id}/export`} download><Icon name="download" size={16}/><span>{selected.status==='complete'?'Export TXT':'Export partial TXT'}</span></a>:<button className="tool-button export-button" disabled><Icon name="download" size={16}/><span>Export TXT</span></button>}</div></div>
-          {text ? <><div className="transcript-search"><Icon name="search" size={17}/><input aria-label="Search transcript" type="search" placeholder="Find a word or phrase…" value={search} onChange={event=>setSearch(event.target.value)}/>{query&&<span className="search-count">{matches?`${Math.min(searchIndex+1,matches)} of ${matches}`:'No matches'}</span>}{matches>1&&<><button className="icon-button previous-match" aria-label="Previous search match" onClick={()=>setSearchIndex(current=>(current-1+matches)%matches)}><Icon name="chevron" size={13}/></button><button className="icon-button" aria-label="Next search match" onClick={()=>setSearchIndex(current=>(current+1)%matches)}><Icon name="chevron" size={13}/></button></>}</div><div ref={transcriptRef} className="transcript-text" style={{fontSize:preferences.app.fontSize}} tabIndex={0} aria-label={selected?.status==='complete'?'Complete transcript':'Partial transcript'}>{parts.map((part,index)=>query&&index%2===1?<mark key={index} data-match={(index-1)/2} className={(index-1)/2===searchIndex?'current-match':''}>{part}</mark>:part)}{selected&&ACTIVE.has(selected.status)&&<span className="live-indicator" aria-label="More text is being transcribed"/>}</div><div className="transcript-footer"><span>{new Intl.NumberFormat('en').format(text.trim().split(/\s+/).filter(Boolean).length)} words<span className="footer-dot">·</span>{selected?.status==='complete'?'Original transcript':'Partial · TXT includes saved sections only'}</span><span>UTF-8 · Diacritics preserved</span></div></> : <div className="transcript-empty"><div className="paper-illustration"><div className="paper-top"><Icon name="wave" size={26}/><span/></div><div className="paper-line long"/><div className="paper-line"/><div className="paper-line short"/><span className="paper-spark"><Icon name="check" size={15}/></span></div><h3>{selected&&ACTIVE.has(selected.status)?'Listening, one section at a time.':'Your lecture, in your own words.'}</h3><p>{selected&&ACTIVE.has(selected.status)?'Text will appear as it arrives. You can leave this tab open or come back later.':selected?'Choose Transcribe to turn this recording into text.':'Add a recording to begin. Your original transcript will appear here, ready to read and keep.'}</p><span className="empty-caption">{selected&&ACTIVE.has(selected.status)?<><span className="spinner"/> {STATUS[selected.status]}</>:<><Icon name="file" size={14}/>No summaries. No rewrites. Just the transcript.</>}</span></div>}
+        <section className="transcript-card" aria-label="Transcript"><div className="transcript-toolbar"><div className="transcript-title"><Icon name="file" size={18}/><h2>Transcript</h2>{text&&<span className={`transcript-badge ${flagged?'needs-review':selected?.status==='complete'?'complete':''}`}>{flagged?'Review needed':selected?.status==='complete'?'Complete':'Partial'}</span>}</div><div className="transcript-tools"><div className="font-controls"><button onClick={()=>void savePreferences({...preferences,app:{...preferences.app,fontSize:Math.max(14,preferences.app.fontSize-1)}})} disabled={preferences.app.fontSize<=14} aria-label="Decrease transcript font size">A−</button><button onClick={()=>void savePreferences({...preferences,app:{...preferences.app,fontSize:Math.min(26,preferences.app.fontSize+1)}})} disabled={preferences.app.fontSize>=26} aria-label="Increase transcript font size">A+</button></div><span className="toolbar-divider"/><button className="tool-button" title="Copy saved transcript text and review annotations. Unfinished live text is excluded." disabled={!text} onClick={()=>void copyText()}><Icon name={copied?'check':'copy'} size={16}/><span>{copied?'Copied':'Copy all'}</span></button>{text&&selected?<a className="tool-button export-button" title="Download saved transcript text with review and unfinished-section annotations. Live draft text is excluded." href={`/api/jobs/${selected.id}/export`} download><Icon name="download" size={16}/><span>{selected.status==='complete'?'Export TXT':'Export partial TXT'}</span></a>:<button className="tool-button export-button" disabled><Icon name="download" size={16}/><span>Export TXT</span></button>}</div></div>
+          {segments.length>0 ? <><div className="transcript-search"><Icon name="search" size={17}/><input aria-label="Search transcript" type="search" placeholder="Find a word or phrase…" value={search} onChange={event=>setSearch(event.target.value)}/>{query&&<span className="search-count">{matches?`${Math.min(searchIndex+1,matches)} of ${matches}`:'No matches'}</span>}{matches>1&&<><button className="icon-button previous-match" aria-label="Previous search match" onClick={()=>setSearchIndex(current=>(current-1+matches)%matches)}><Icon name="chevron" size={13}/></button><button className="icon-button" aria-label="Next search match" onClick={()=>setSearchIndex(current=>(current+1)%matches)}><Icon name="chevron" size={13}/></button></>}</div><div ref={transcriptRef} className="transcript-text" style={{fontSize:preferences.app.fontSize}} tabIndex={0} aria-label={flagged?'Transcript requiring review':selected?.status==='complete'?'Complete transcript':'Partial transcript'}>{segments.map((segment,index)=>segment.draft?<span key={index} className="transcript-live-draft"><small>Unfinished live text{segment.chunk?` · ${rangeLabel(segment.chunk)}`:''} · excluded from Copy all and TXT</small>{highlighted(segment.text)}</span>:segment.chunk&&isChunkFinished(segment.chunk)?<button key={index} className={`review-marker ${playbackRange?.chunkId===segment.chunk.id?'selected-interval':''}`} onClick={()=>playReviewInterval(segment.chunk!)} aria-pressed={playbackRange?.chunkId===segment.chunk.id} aria-label={`Review ${selected?.filename}, ${rangeLabel(segment.chunk)}: ${segment.chunk.status==='no_text'?'no text returned':'possibly incomplete transcript'}`}><Icon name="warning" size={17}/><span lang="ro">{highlighted(segment.text)}</span><Icon name="play" size={16}/></button>:segment.chunk?<span key={index} className={`unfinished-marker ${segment.chunk.status}`}><strong>{segment.chunk.status==='failed'?'API request failed':segment.chunk.status==='interrupted'?'Interrupted request':'Not yet processed'}</strong><span lang="ro">{highlighted(segment.text)}</span></span>:<span key={index} className="original-transcript-text">{highlighted(segment.text)}</span>)}{selected&&['uploading','transcribing'].includes(selected.status)&&<span className="live-indicator" aria-label="More text is being transcribed"/>}</div><div className="transcript-footer"><span>{new Intl.NumberFormat('en').format(orderedChunks.reduce((sum,chunk)=>sum+countWords(chunk.status==='complete'?chunk.text??'':''),0))} returned words<span className="footer-dot">·</span>{flagged?'App review notes included':selected?.status==='complete'?'Original returned text':'Partial · live text excluded from TXT'}</span><span>UTF-8 · Diacritics preserved</span></div></> : <div className="transcript-empty"><div className="paper-illustration"><div className="paper-top"><Icon name="wave" size={26}/><span/></div><div className="paper-line long"/><div className="paper-line"/><div className="paper-line short"/><span className="paper-spark"><Icon name="check" size={15}/></span></div><h3>{selected?.status==='analyzing'?'Checking speech activity on your Mac.':selected&&ACTIVE.has(selected.status)?'Listening, one section at a time.':'Your lecture, in your own words.'}</h3><p>{selected?.status==='analyzing'?'Local speech detection helps flag sections for review. It does not remove audio or guarantee a complete transcript.':selected&&ACTIVE.has(selected.status)?'Text will appear as it arrives. You can leave this tab open or come back later.':selected?'Choose Transcribe to turn this recording into text.':'Add a recording to begin. Your original transcript will appear here, ready to read and keep.'}</p><span className="empty-caption">{selected&&ACTIVE.has(selected.status)?<><span className="spinner"/> {STATUS[selected.status]}</>:<><Icon name="file" size={14}/>No summaries. No rewrites. Just the transcript.</>}</span></div>}
         </section>
         <footer className="page-footer"><span><Icon name="shield" size={13}/>Local workspace · Audio sent to OpenAI only when you start</span><span>{MODEL} <span>·</span> {money(boot.pricing.usdPerMinute).startsWith('<')?`$${boot.pricing.usdPerMinute}`:money(boot.pricing.usdPerMinute)}/min</span></footer>
       </div>

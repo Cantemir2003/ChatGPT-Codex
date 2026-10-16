@@ -16,6 +16,9 @@ await mkdir(directory, { recursive: true });
 const recording = join(directory, 'mock-romanian-lecture.m4a');
 const generated = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=44100', '-t', '3', '-c:a', 'aac', '-y', recording], { encoding: 'utf8' });
 if (generated.status !== 0) throw new Error('The browser test requires FFmpeg to create its synthetic audio.');
+const reviewRecording = join(directory, 'review-fixture.wav');
+const generatedReview = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=16000', '-t', '125', '-c:a', 'pcm_s16le', '-y', reviewRecording], {encoding:'utf8'});
+if (generatedReview.status !== 0) throw new Error('Could not generate review-test audio.');
 
 // Deliberately mock the platform keychain, never the browser or production API routes.
 class MemoryKeyStore implements KeyStore {
@@ -30,8 +33,17 @@ const store = new Store(join(directory, 'data'));
 const expectedText = 'Bună ziua. Astăzi discutăm despre sănătatea orală și țesuturile dentare.\n\nȘtiință, înțelegere și îngrijire. Repetăm: îngrijire, îngrijire.\nAcesta este un răspuns simulat pentru verificarea aplicației.';
 const engine = new Engine(store, {
   key: () => keyStore.get(),
-  transcriber: async ({ signal, onPhase, onDelta }) => {
+  // VAD evidence is explicitly simulated here; real inference has separate integration tests.
+  analyze: async (_path,audio) => ({status:'complete',model:'browser-test-mock',version:'fixture',
+    intervals:audio.duration>100?[{start:0,end:audio.duration}]:[],speechSeconds:audio.duration>100?audio.duration:0,analyzedSeconds:audio.duration}),
+  transcriber: async ({ file, signal, onPhase, onDelta }) => {
     onPhase('transcribing');
+    const job=store.list().find(item=>item.chunks.some(chunk=>chunk.file===file));
+    if (job?.filename==='review-fixture.wav') {
+      await delay(100,undefined,{signal});
+      const index=job.chunks.find(chunk=>chunk.file===file)!.index;
+      return {text:index===0?'Text foarte scurt.':index===1?'':' \t',testFixture:true};
+    }
     onDelta('Bună ziua. Astăzi discutăm despre sănătatea orală');
     await delay(650, undefined, { signal });
     return { text: expectedText, testFixture: true };
@@ -69,6 +81,6 @@ await new Promise<void>((resolveReady, reject) => {
 });
 const address = server.address();
 if (!address || typeof address === 'string') throw new Error('The UI test server could not start.');
-process.stdout.write(JSON.stringify({ url: `http://127.0.0.1:${address.port}`, recording, expectedText }) + '\n');
+process.stdout.write(JSON.stringify({ url: `http://127.0.0.1:${address.port}`, recording, reviewRecording, expectedText }) + '\n');
 process.on('SIGTERM', () => { void shutdown(); });
 process.on('SIGINT', () => { void shutdown(); });

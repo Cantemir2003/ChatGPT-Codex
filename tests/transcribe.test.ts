@@ -56,6 +56,23 @@ describe('exact-model transcription requests', () => {
     expect(args.onDelta).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['empty text', { text: '', usage: { seconds: 60 } }],
+    ['whitespace text', { text: '  \n\t ', usage: { seconds: 60 } }],
+    ['missing text', { usage: { seconds: 60 } }],
+    ['null text', { text: null, usage: { seconds: 60 } }],
+    ['numeric text', { text: 42, usage: { seconds: 60 } }],
+  ])('preserves a successful JSON response with %s without another paid request', async (_label, response) => {
+    const mockedFetch = vi.fn(async () => new Response(JSON.stringify(response), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', mockedFetch);
+    const args = input({ ...DEFAULTS.transcription, stream: false });
+    await expect(transcribe(args)).resolves.toStrictEqual(response);
+    expect(mockedFetch).toHaveBeenCalledOnce();
+    expect(args.onDelta).not.toHaveBeenCalled();
+  });
+
   it('treats the final streaming event as authoritative and preserves raw events', async () => {
     const events = [
       { type: 'transcript.text.delta', delta: 'sint' },
@@ -67,15 +84,58 @@ describe('exact-model transcription requests', () => {
     const result = await transcribe(args);
     expect(args.onDelta.mock.calls).toEqual([['sint'], ['eza']]);
     expect(args.onPhase.mock.calls).toEqual([['uploading'], ['transcribing']]);
-    expect(result.text).toBe('  Sinteză. Sinteză.\n');
-    expect(result.events).toEqual(events);
+    expect(result).toStrictEqual({ ...events[2], events });
+  });
+
+  it.each([
+    ['empty text', { text: '' }],
+    ['whitespace text', { text: '  \n\t ' }],
+    ['missing text', {}],
+    ['null text', { text: null }],
+    ['numeric text', { text: 42 }],
+  ])('preserves a terminal streaming response with %s without substituting deltas or retrying', async (_label, fields) => {
+    const terminal = { type: 'transcript.text.done', ...fields, usage: { total_tokens: 22 } };
+    const events = [
+      { type: 'transcript.text.delta', delta: 'partial only' },
+      terminal,
+    ];
+    const mockedFetch = vi.fn(async () => sse(events));
+    vi.stubGlobal('fetch', mockedFetch);
+    const args = input({ ...DEFAULTS.transcription, stream: true });
+    await expect(transcribe(args)).resolves.toStrictEqual({ ...terminal, events });
+    expect(mockedFetch).toHaveBeenCalledOnce();
+    expect(args.onDelta.mock.calls).toEqual([['partial only']]);
+    expect(args.onPhase.mock.calls).toEqual([['uploading'], ['transcribing']]);
   });
 
   it('rejects a stream ending without a final event instead of exporting fragments', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => sse([{ type: 'transcript.text.delta', delta: 'partial only' }])));
+    const mockedFetch = vi.fn(async () => sse([{ type: 'transcript.text.delta', delta: 'partial only' }]));
+    vi.stubGlobal('fetch', mockedFetch);
     const args = input({ ...DEFAULTS.transcription, stream: true });
     await expect(transcribe(args)).rejects.toThrow('incomplete_stream');
+    expect(mockedFetch).toHaveBeenCalledOnce();
     expect(args.onDelta).toHaveBeenCalledWith('partial only');
+  });
+
+  it.each([{ text: '' }, {}])('keeps a terminal response %j even if the transport fails immediately afterward', async fields => {
+    const events = [
+      { type: 'transcript.text.delta', delta: 'provisional text' },
+      { type: 'transcript.text.done', ...fields },
+    ];
+    const bytes = new TextEncoder().encode(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''));
+    let pulls = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (pulls++ === 0) controller.enqueue(bytes);
+        else controller.error(new Error('Connection reset after the terminal response.'));
+      },
+    });
+    const mockedFetch = vi.fn(async () => new Response(body, { headers: { 'content-type': 'text/event-stream' } }));
+    vi.stubGlobal('fetch', mockedFetch);
+    const args = input({ ...DEFAULTS.transcription, stream: true });
+    await expect(transcribe(args)).resolves.toStrictEqual({ ...events[1], events });
+    expect(args.onDelta).toHaveBeenCalledWith('provisional text');
+    expect(mockedFetch).toHaveBeenCalledOnce();
   });
 
   it('disables SDK retries so the persistent engine controls all billable attempts', async () => {

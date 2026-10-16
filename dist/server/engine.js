@@ -3,10 +3,12 @@ import { mkdir, rename, rm, stat } from 'node:fs/promises';
 import { join, basename, extname } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { estimateCost } from '../shared/config.js';
+import { applyResponse, isChunkFinished, refreshReview } from '../shared/review.js';
 import { inspectAudio, prepareChunks } from './audio.js';
+import { analyzeSpeech, VAD_MODEL, VAD_VERSION } from './vad.js';
 import { AppError, validateApp, validateTranscription } from './validation.js';
 import { transcribe, classifyError } from './transcribe.js';
-const ACTIVE = ['queued', 'preparing', 'uploading', 'transcribing', 'retrying'];
+const ACTIVE = ['queued', 'preparing', 'analyzing', 'uploading', 'transcribing', 'retrying'];
 export class Engine {
     store;
     options;
@@ -95,8 +97,24 @@ export class Engine {
                     throw new AppError('No audio sections could be prepared.');
                 this.store.save(job);
             }
+            if (!job.speech) {
+                signal.throwIfAborted();
+                job.status = 'analyzing';
+                this.store.save(job);
+                try {
+                    const speech = await (this.options.analyze ?? analyzeSpeech)(job.sourceFile, job.audio, signal);
+                    signal.throwIfAborted();
+                    job.speech = speech;
+                }
+                catch (error) {
+                    if (signal.aborted)
+                        throw error;
+                    job.speech = { status: 'unavailable', model: VAD_MODEL, version: VAD_VERSION, intervals: [], speechSeconds: 0, analyzedSeconds: 0, reason: 'Local speech analysis could not be completed.' };
+                }
+                this.store.save(job);
+            }
             for (const chunk of [...job.chunks].sort((a, b) => a.index - b.index)) {
-                if (chunk.status === 'complete')
+                if (isChunkFinished(chunk))
                     continue;
                 signal.throwIfAborted();
                 await this.processChunk(job, chunk, signal);
@@ -105,7 +123,7 @@ export class Engine {
             job.error = undefined;
             job.partialText = '';
             this.store.save(job);
-            if (!job.appSettings.keepAudio)
+            if (!job.appSettings.keepAudio && !job.review?.needsReview)
                 await this.cleanupAudio(job);
         }
         catch (error) {
@@ -134,6 +152,7 @@ export class Engine {
             }
             job.partialText = '';
             job.status = 'uploading';
+            chunk.status = 'pending';
             const attempt = { startedAt: new Date().toISOString(), outcome: 'pending', estimatedUsd: estimateCost(chunk.end - chunk.start) };
             chunk.attempts.push(attempt);
             const index = chunk.attempts.length - 1;
@@ -152,11 +171,11 @@ export class Engine {
                         persistProgress();
                         lastSave = Date.now();
                     } }, onPhase: phase => { job.status = phase; persistProgress(); } });
-                if (typeof result.text !== 'string')
-                    throw new Error('invalid_response');
             }
             catch (error) {
                 const info = error instanceof AppError ? { message: error.message, retryable: false, uncertain: true, stopQueue: true } : classifyError(error);
+                const status = error && typeof error === 'object' ? error.status : undefined;
+                chunk.status = signal.aborted || (info.uncertain && (!status || status === 408)) ? 'interrupted' : 'failed';
                 chunk.attempts[index] = { ...attempt, outcome: signal.aborted || info.uncertain ? 'uncertain' : 'failed', endedAt: new Date().toISOString() };
                 this.store.save(job);
                 this.store.record(job, chunk.id, index, chunk.attempts[index]);
@@ -178,11 +197,12 @@ export class Engine {
                 this.store.saveResponse(job, chunk.id, result);
             }
             catch {
+                chunk.status = 'interrupted';
+                chunk.attempts[index] = { ...attempt, outcome: 'uncertain', endedAt: new Date().toISOString() };
                 this.pauseQueue('Free disk space before resuming.');
                 throw new AppError('The returned section could not be saved. Free disk space before resuming; this successful API request may have been charged.', 500);
             }
-            chunk.text = result.text;
-            chunk.status = 'complete';
+            applyResponse(chunk, result);
             chunk.attempts[index] = { ...attempt, outcome: 'success', endedAt: new Date().toISOString() };
             job.partialText = '';
             this.store.save(job);
@@ -207,7 +227,8 @@ export class Engine {
     } return job; }
     async remove(id) { const job = this.store.get(id); if (ACTIVE.includes(job.status) || this.active === id && this.running)
         throw new AppError('Stop this lecture before deleting it.', 409); this.store.remove(id); }
-    async cleanupAudio(job) { try {
+    async cleanupAudio(job) { refreshReview(job); if (job.status !== 'complete' || !job.chunks.length || !job.chunks.every(isChunkFinished) || job.appSettings.keepAudio || job.review?.needsReview)
+        return; try {
         this.store.assertOwned(job);
         await rm(join(this.store.jobDir(job.id), 'audio'), { recursive: true, force: true });
         await rm(job.sourceFile, { force: true });
